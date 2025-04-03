@@ -16,12 +16,14 @@ package prober
 import (
 	"bytes"
 	"context"
+	"errors"
 	"log/slog"
 	"math/rand"
 	"net"
 	"os"
 	"runtime"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -85,7 +87,12 @@ func ProbeICMP(ctx context.Context, target string, module config.Module, registr
 		durationGaugeVec.WithLabelValues(lv)
 	}
 
+	probeFailedDueToSource := prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "probe_failed_due_to_source",
+		Help: "Indicates if probe failed due to source address",
+	})
 	registry.MustRegister(durationGaugeVec)
+	registry.MustRegister(probeFailedDueToSource)
 
 	dstIPAddr, lookupTime, err := chooseProtocol(ctx, module.ICMP.IPProtocol, module.ICMP.IPProtocolFallback, target, registry, logger)
 
@@ -99,6 +106,15 @@ func ProbeICMP(ctx context.Context, target string, module config.Module, registr
 	if len(module.ICMP.SourceIPAddress) > 0 {
 		if srcIP = net.ParseIP(module.ICMP.SourceIPAddress); srcIP == nil {
 			logger.Error("Error parsing source ip address", "srcIP", module.ICMP.SourceIPAddress)
+			return false
+		}
+		logger.Info("Using source address", "srcIP", srcIP)
+	}
+
+	if ctxSourceAddress, ok := ctx.Value(SourceAddressKey).(string); ok && ctxSourceAddress != "" {
+		srcIP = net.ParseIP(ctxSourceAddress)
+		if srcIP == nil {
+			logger.Error("Error parsing source ip address", "srcIP", ctxSourceAddress)
 			return false
 		}
 		logger.Info("Using source address", "srcIP", srcIP)
@@ -123,8 +139,12 @@ func ProbeICMP(ctx context.Context, target string, module config.Module, registr
 			// "udp" here means unprivileged -- not the protocol "udp".
 			icmpConn, err = icmp.ListenPacket("udp6", srcIP.String())
 			if err != nil {
+				if errors.Is(err, syscall.EADDRNOTAVAIL) {
+					probeFailedDueToSource.Set(1)
+				}
 				logger.Debug("Unable to do unprivileged listen on socket, will attempt privileged", "err", err)
 			} else {
+				probeFailedDueToSource.Set(0)
 				privileged = false
 			}
 		}
@@ -132,8 +152,13 @@ func ProbeICMP(ctx context.Context, target string, module config.Module, registr
 		if privileged {
 			icmpConn, err = icmp.ListenPacket("ip6:ipv6-icmp", srcIP.String())
 			if err != nil {
+				if errors.Is(err, syscall.EADDRNOTAVAIL) {
+					probeFailedDueToSource.Set(1)
+				}
 				logger.Error("Error listening to socket", "err", err)
 				return
+			} else {
+				probeFailedDueToSource.Set(0)
 			}
 		}
 		defer icmpConn.Close()
@@ -155,8 +180,13 @@ func ProbeICMP(ctx context.Context, target string, module config.Module, registr
 			// sockets as it is not possible to set IP header level options.
 			netConn, err := net.ListenPacket("ip4:icmp", srcIP.String())
 			if err != nil {
+				if errors.Is(err, syscall.EADDRNOTAVAIL) {
+					probeFailedDueToSource.Set(1)
+				}
 				logger.Error("Error listening to socket", "err", err)
 				return
+			} else {
+				probeFailedDueToSource.Set(0)
 			}
 			defer netConn.Close()
 
@@ -175,8 +205,12 @@ func ProbeICMP(ctx context.Context, target string, module config.Module, registr
 			if tryUnprivileged {
 				icmpConn, err = icmp.ListenPacket("udp4", srcIP.String())
 				if err != nil {
+					if errors.Is(err, syscall.EADDRNOTAVAIL) {
+						probeFailedDueToSource.Set(1)
+					}
 					logger.Debug("Unable to do unprivileged listen on socket, will attempt privileged", "err", err)
 				} else {
+					probeFailedDueToSource.Set(0)
 					privileged = false
 				}
 			}
@@ -184,8 +218,13 @@ func ProbeICMP(ctx context.Context, target string, module config.Module, registr
 			if privileged {
 				icmpConn, err = icmp.ListenPacket("ip4:icmp", srcIP.String())
 				if err != nil {
+					if errors.Is(err, syscall.EADDRNOTAVAIL) {
+						probeFailedDueToSource.Set(1)
+					}
 					logger.Error("Error listening to socket", "err", err)
 					return
+				} else {
+					probeFailedDueToSource.Set(0)
 				}
 			}
 			defer icmpConn.Close()

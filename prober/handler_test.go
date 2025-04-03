@@ -257,3 +257,97 @@ func TestTCPHostnameParam(t *testing.T) {
 	}
 
 }
+
+func TestSourceAddressParam(t *testing.T) {
+	type testdata struct {
+		sourceAddr    string // 设置的源地址
+		shouldSucceed bool   // 是否通信失败
+	}
+
+	headers := map[string]string{}
+	c := &config.Config{
+		Modules: map[string]config.Module{
+			"http_2xx": {
+				Prober:  "http",
+				Timeout: 10 * time.Second,
+				HTTP: config.HTTPProbe{
+					Headers:            headers,
+					IPProtocolFallback: true,
+				},
+			},
+		},
+	}
+
+	addrs, err := net.InterfaceAddrs()
+	if err != nil {
+		t.Fatalf("Failed to get local addresses: %v", err)
+	}
+	var validAddr string
+	for _, addr := range addrs {
+		ipNet, ok := addr.(*net.IPNet)
+		if ok && !ipNet.IP.IsLoopback() && ipNet.IP.To4() != nil {
+			validAddr = ipNet.IP.String()
+			break
+		}
+	}
+
+	testcases := map[string]testdata{
+		"validAddr": {
+			sourceAddr:    "127.0.0.1",
+			shouldSucceed: true,
+		},
+		// 非lo的地址无法访问http服务
+		"invalidAddr": {
+			sourceAddr:    validAddr,
+			shouldSucceed: false,
+		},
+	}
+
+	for _, data := range testcases {
+
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			remoteAddr := r.RemoteAddr
+			ip, _, err := net.SplitHostPort(remoteAddr)
+			if err != nil {
+				http.Error(w, "Invalid remote address", http.StatusInternalServerError)
+				return
+			}
+			if ip != data.sourceAddr {
+				w.WriteHeader(http.StatusBadRequest)
+				t.Fatalf("Expected source address %s, got %s", data.sourceAddr, ip)
+			} else {
+				w.WriteHeader(http.StatusOK)
+			}
+		}))
+		defer ts.Close()
+
+		requrl := fmt.Sprintf("%s?debug=true&source_address=%s&target=%s", ts.URL, data.sourceAddr, ts.URL)
+		req, err := http.NewRequest("GET", requrl, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		rr := httptest.NewRecorder()
+
+		handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			Handler(w, r, c, promslog.NewNopLogger(), &ResultHistory{}, 0.5, nil, nil, promslog.NewLevel())
+		})
+
+		handler.ServeHTTP(rr, req)
+
+		if data.shouldSucceed {
+			if !strings.Contains(rr.Body.String(), "Probe succeeded") {
+				t.Errorf("Expected probe to succeed, but failed. Response body: %v", rr.Body.String())
+			}
+		} else {
+			if !strings.Contains(rr.Body.String(), "Probe failed") {
+				t.Errorf("Expected probe to fail, but succeeded. Response body: %v", rr.Body.String())
+			}
+		}
+		// 可以通过下方代码查看请求过程的详细信息
+		// check debug output to confirm the server_name is set in tls_config and matches supplied hostname
+		//if !strings.Contains(rr.Body.String(), "server_name: "+hostname) {
+		//	t.Errorf("probe failed, response body: %v", rr.Body.String())
+		//}
+	}
+}

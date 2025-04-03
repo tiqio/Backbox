@@ -33,6 +33,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/andybalholm/brotli"
@@ -359,6 +360,11 @@ func ProbeHTTP(ctx context.Context, target string, module config.Module, registr
 			Name: "probe_http_last_modified_timestamp_seconds",
 			Help: "Returns the Last-Modified HTTP response header in unixtime",
 		})
+
+		probeFailedDueToSource = prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "probe_failed_due_to_source",
+			Help: "Indicates if probe failed due to source address",
+		})
 	)
 
 	registry.MustRegister(durationGaugeVec)
@@ -369,6 +375,7 @@ func ProbeHTTP(ctx context.Context, target string, module config.Module, registr
 	registry.MustRegister(statusCodeGauge)
 	registry.MustRegister(probeHTTPVersionGauge)
 	registry.MustRegister(probeFailedDueToRegex)
+	registry.MustRegister(probeFailedDueToSource)
 
 	httpConfig := module.HTTP
 
@@ -415,14 +422,35 @@ func ProbeHTTP(ctx context.Context, target string, module config.Module, registr
 			}
 		}
 	}
-	client, err := pconfig.NewClientFromConfig(httpClientConfig, "http_probe", pconfig.WithKeepAlivesDisabled())
+
+	sourceDialContext := func(ctx context.Context, network, addr string) (net.Conn, error) {
+		if ctxSourceAddress, ok := ctx.Value(SourceAddressKey).(string); ok && ctxSourceAddress != "" {
+			srcIP := net.ParseIP(ctxSourceAddress)
+			if srcIP == nil {
+				logger.Error("Error parsing source ip address", "srcIP", ctxSourceAddress)
+				return nil, fmt.Errorf("error parsing source ip address: %s", ctxSourceAddress)
+			}
+			logger.Info("Using local address", "srcIP", srcIP)
+			d := &net.Dialer{
+				LocalAddr: &net.TCPAddr{IP: srcIP},
+			}
+			return d.DialContext(ctx, network, addr)
+		} else {
+			d := &net.Dialer{}
+			return d.DialContext(ctx, network, addr)
+		}
+	}
+
+	client, err := pconfig.NewClientFromConfig(httpClientConfig, "http_probe",
+		pconfig.WithKeepAlivesDisabled(), pconfig.WithDialContextFunc(sourceDialContext))
 	if err != nil {
 		logger.Error("Error generating HTTP client", "err", err)
 		return false
 	}
 
 	httpClientConfig.TLSConfig.ServerName = ""
-	noServerName, err := pconfig.NewRoundTripperFromConfig(httpClientConfig, "http_probe", pconfig.WithKeepAlivesDisabled())
+	noServerName, err := pconfig.NewRoundTripperFromConfig(httpClientConfig, "http_probe",
+		pconfig.WithKeepAlivesDisabled(), pconfig.WithDialContextFunc(sourceDialContext))
 	if err != nil {
 		logger.Error("Error generating HTTP client without ServerName", "err", err)
 		return false
@@ -534,7 +562,12 @@ func ProbeHTTP(ctx context.Context, target string, module config.Module, registr
 	if resp == nil {
 		resp = &http.Response{}
 		if err != nil {
+			if errors.Is(err, syscall.EADDRNOTAVAIL) {
+				probeFailedDueToSource.Set(1)
+			}
 			logger.Error("Error for HTTP request", "err", err)
+		} else {
+			probeFailedDueToSource.Set(0)
 		}
 	} else {
 		requestErrored := (err != nil)

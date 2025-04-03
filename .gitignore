@@ -28,3 +28,5 @@ dependencies-stamp
 .deps
 *.tar.gz
 /vendor
+main
+ddtest

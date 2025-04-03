@@ -17,12 +17,13 @@ import (
 	"bufio"
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
-	"log/slog"
-	"net"
-
 	"github.com/prometheus/client_golang/prometheus"
 	pconfig "github.com/prometheus/common/config"
+	"log/slog"
+	"net"
+	"syscall"
 
 	"github.com/prometheus/blackbox_exporter/config"
 )
@@ -53,6 +54,16 @@ func dialTCP(ctx context.Context, target string, module config.Module, registry 
 		if srcIP == nil {
 			logger.Error("Error parsing source ip address", "srcIP", module.TCP.SourceIPAddress)
 			return nil, fmt.Errorf("error parsing source ip address: %s", module.TCP.SourceIPAddress)
+		}
+		logger.Info("Using local address", "srcIP", srcIP)
+		dialer.LocalAddr = &net.TCPAddr{IP: srcIP}
+	}
+
+	if ctxSourceAddress, ok := ctx.Value(SourceAddressKey).(string); ok && ctxSourceAddress != "" {
+		srcIP := net.ParseIP(ctxSourceAddress)
+		if srcIP == nil {
+			logger.Error("Error parsing source ip address", "srcIP", ctxSourceAddress)
+			return nil, fmt.Errorf("error parsing source ip address: %s", ctxSourceAddress)
 		}
 		logger.Info("Using local address", "srcIP", srcIP)
 		dialer.LocalAddr = &net.TCPAddr{IP: srcIP}
@@ -123,13 +134,23 @@ func ProbeTCP(ctx context.Context, target string, module config.Module, registry
 		Name: "probe_failed_due_to_regex",
 		Help: "Indicates if probe failed due to regex",
 	})
+	probeFailedDueToSource := prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "probe_failed_due_to_source",
+		Help: "Indicates if probe failed due to source address",
+	})
 	registry.MustRegister(probeFailedDueToRegex)
+	registry.MustRegister(probeFailedDueToSource)
 	deadline, _ := ctx.Deadline()
 
 	conn, err := dialTCP(ctx, target, module, registry, logger)
 	if err != nil {
+		if errors.Is(err, syscall.EADDRNOTAVAIL) {
+			probeFailedDueToSource.Set(1)
+		}
 		logger.Error("Error dialing TCP", "err", err)
 		return false
+	} else {
+		probeFailedDueToSource.Set(0)
 	}
 	defer conn.Close()
 	logger.Info("Successfully dialed")

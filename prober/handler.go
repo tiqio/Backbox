@@ -41,7 +41,23 @@ var (
 		"dns":  ProbeDNS,
 		"grpc": ProbeGRPC,
 	}
+	supportedProbers = []string{
+		"http",
+		"tcp",
+		"icmp",
+	}
 )
+
+const SourceAddressKey = "source"
+
+func isSupportedProber(prober string) bool {
+	for _, supportedProber := range supportedProbers {
+		if prober == supportedProber {
+			return true
+		}
+	}
+	return false
+}
 
 func Handler(w http.ResponseWriter, r *http.Request, c *config.Config, logger *slog.Logger, rh *ResultHistory, timeoutOffset float64, params url.Values,
 	moduleUnknownCounter prometheus.Counter,
@@ -87,6 +103,15 @@ func Handler(w http.ResponseWriter, r *http.Request, c *config.Config, logger *s
 	if target == "" {
 		http.Error(w, "Target parameter is missing", http.StatusBadRequest)
 		return
+	}
+
+	source := params.Get("source_address")
+	if source != "" {
+		if !isSupportedProber(module.Prober) {
+			http.Error(w, "Source address is not supported for this prober", http.StatusBadRequest)
+			return
+		}
+		ctx = context.WithValue(ctx, SourceAddressKey, source)
 	}
 
 	prober, ok := Probers[module.Prober]
